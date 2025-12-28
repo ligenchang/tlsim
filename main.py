@@ -3,16 +3,20 @@ Usage:
     python main.py [hostname] [--all-ciphers]
     
 Examples:
-    python main.py                       # Connects to google.com (default, RSA only)
+    python main.py                       # Connects to google.com with ECDHE support
+    python main.py yhss.hpb.gov.sg       # Connect to a specific server
     python main.py badssl.com            # Test with badssl.com
-    python main.py --all-ciphers google.com  # Try with all cipher suites (will see ECDHE message)
     
 Educational TLS 1.2 Implementation:
-    This client demonstrates a complete TLS 1.2 handshake with RSA key exchange,
+    This client demonstrates a complete TLS 1.2 handshake with both RSA and ECDHE key exchange,
     including encrypted Finished messages and application data exchange.
     
-    Modern servers require ECDHE, which this implementation doesn't support.
-    When connecting to such servers, you'll see an educational message about ECDHE.
+    Supported features:
+    - RSA and ECDHE key exchange (secp256r1, secp384r1, secp521r1, x25519)
+    - CBC cipher suites (AES-128/256-CBC-SHA)
+    - GCM cipher suites (AES-128/256-GCM-SHA256/384)
+    - Certificate chain validation
+    - Hostname verification
 """
 
 import socket
@@ -31,7 +35,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hmac
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 import hashlib
 
 
@@ -50,8 +57,8 @@ CIPHER_SUITES_ALL += b"\xc0\x30"  # TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
 CIPHER_SUITES_ALL += b"\xc0\x13"  # TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
 CIPHER_SUITES_ALL += b"\xc0\x14"  # TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
 
-# Use RSA-only by default for educational purposes
-CIPHER_SUITES = CIPHER_SUITES_RSA_ONLY
+# Use ECDHE by default for modern server compatibility
+CIPHER_SUITES = CIPHER_SUITES_ALL
 
 # TLS Record Types
 HANDSHAKE_RECORD = 0x16
@@ -89,6 +96,10 @@ server_write_iv = b""
 # Sequence numbers for MAC computation
 client_seq_num = 0
 server_seq_num = 0
+
+# ECDHE specific variables
+server_ecdh_public_key = None
+ecdh_curve = None
 
 def build_client_hello(server_name: str) -> bytes:
     """
@@ -648,9 +659,225 @@ def parse_certificate(handshake, expected_hostname):
     return certificates
 
 
-def PRF(secret, label, seed, length):
+def parse_server_key_exchange(handshake_body, server_cert_der):
     """
-    TLS 1.2 Pseudorandom Function (PRF) using HMAC-SHA256.
+    Parses the ServerKeyExchange message for ECDHE cipher suites.
+    
+    ServerKeyExchange contains:
+        - EC curve type (1 byte) - should be 0x03 (named_curve)
+        - Named curve ID (2 bytes) - e.g., 0x0017 = secp256r1
+        - Public key length (1 byte)
+        - Public key (variable)
+        - Signature algorithm (2 bytes) - e.g., 0x0401 = RSA-PKCS1-SHA256
+        - Signature length (2 bytes)
+        - Signature (variable)
+    """
+    global server_ecdh_public_key, ecdh_curve
+    
+    offset = 0
+    curve_type = handshake_body[offset]
+    offset += 1
+    
+    if curve_type != 0x03:
+        print(f"[ERROR] Unsupported curve type: {curve_type}")
+        return False
+    
+    # Named curve ID
+    curve_id = struct.unpack("!H", handshake_body[offset:offset+2])[0]
+    offset += 2
+    
+    # Map curve IDs to names and cryptography curve objects
+    curve_map = {
+        0x0017: ("secp256r1", ec.SECP256R1(), False),
+        0x0018: ("secp384r1", ec.SECP384R1(), False),
+        0x0019: ("secp521r1", ec.SECP521R1(), False),
+        0x001d: ("x25519", None, True),  # x25519 is special
+    }
+    
+    if curve_id not in curve_map:
+        print(f"[ERROR] Unsupported curve ID: 0x{curve_id:04x}")
+        return False
+    
+    curve_name, curve_obj, is_x25519 = curve_map[curve_id]
+    ecdh_curve = (curve_name, curve_obj, is_x25519)
+    
+    # Public key length and data
+    pubkey_len = handshake_body[offset]
+    offset += 1
+    
+    pubkey_bytes = handshake_body[offset:offset+pubkey_len]
+    offset += pubkey_len
+    
+    # Load the server's ECDH public key
+    try:
+        if is_x25519:
+            # x25519 public key is 32 bytes, no point format byte
+            server_ecdh_public_key = X25519PublicKey.from_public_bytes(pubkey_bytes)
+        else:
+            # Standard EC curves use point format (first byte should be 0x04 for uncompressed)
+            server_ecdh_public_key = ec.EllipticCurvePublicKey.from_encoded_point(curve_obj, pubkey_bytes)
+    except Exception as e:
+        print(f"[ERROR] Failed to load server EC public key: {e}")
+        return False
+    
+    # Signature algorithm
+    sig_alg = struct.unpack("!H", handshake_body[offset:offset+2])[0]
+    offset += 2
+    
+    sig_alg_names = {
+        0x0401: "RSA-PKCS1-SHA256",
+        0x0501: "RSA-PKCS1-SHA384",
+        0x0601: "RSA-PKCS1-SHA512",
+    }
+    sig_alg_name = sig_alg_names.get(sig_alg, f"Unknown (0x{sig_alg:04x})")
+    
+    # Signature length and data
+    sig_len = struct.unpack("!H", handshake_body[offset:offset+2])[0]
+    offset += 2
+    
+    signature = handshake_body[offset:offset+sig_len]
+    
+    print("\n" + "="*60)
+    print("SERVER KEY EXCHANGE (ECDHE)")
+    print("="*60)
+    print(f"Curve: {curve_name} (0x{curve_id:04x})")
+    print(f"Server Public Key Length: {pubkey_len} bytes")
+    print(f"Server Public Key: {pubkey_bytes.hex()}")
+    print(f"Signature Algorithm: {sig_alg_name}")
+    print(f"Signature Length: {sig_len} bytes")
+    print()
+    
+    # Verify the signature
+    # The signature covers: client_random + server_random + ServerECDHParams
+    # ServerECDHParams includes: curve_type (1) + curve_id (2) + pubkey_len (1) + pubkey
+    # This is everything from the beginning up to (but not including) the signature algorithm
+    
+    # Calculate the end of ServerECDHParams
+    # We've parsed: curve_type(1) + curve_id(2) + pubkey_len(1) + pubkey(pubkey_len) + sig_alg(2) + sig_len(2)
+    # So ServerECDHParams is the first (1 + 2 + 1 + pubkey_len) bytes
+    params_len = 1 + 2 + 1 + pubkey_len
+    server_ecdh_params = handshake_body[:params_len]
+    signed_data = client_random + server_random + server_ecdh_params
+    
+    print(f"Debug: ServerECDHParams length: {params_len} bytes")
+    print(f"Debug: ServerECDHParams: {server_ecdh_params.hex()}")
+    print(f"Debug: Signed data length: {len(signed_data)} bytes")
+    print(f"Debug: Client random: {client_random.hex()}")
+    print(f"Debug: Server random: {server_random.hex()}")
+    print()
+    
+    # Load server certificate to get public key
+    cert = x509.load_der_x509_certificate(server_cert_der, default_backend())
+    server_public_key = cert.public_key()
+    
+    # Choose hash algorithm based on signature algorithm
+    if sig_alg == 0x0401:
+        hash_alg = hashes.SHA256()
+    elif sig_alg == 0x0501:
+        hash_alg = hashes.SHA384()
+    elif sig_alg == 0x0601:
+        hash_alg = hashes.SHA512()
+    else:
+        print(f"[WARNING] Unknown signature algorithm, defaulting to SHA256")
+        hash_alg = hashes.SHA256()
+    
+    try:
+        server_public_key.verify(
+            signature,
+            signed_data,
+            padding.PKCS1v15(),
+            hash_alg
+        )
+        print("[OK] ServerKeyExchange signature verified!")
+        print("     The server's ECDH public key is authentic.\n")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Signature verification failed: {e}\n")
+        return False
+
+
+def build_client_key_exchange_ecdhe():
+    """
+    Builds the ClientKeyExchange message for ECDHE cipher suites.
+    
+    For ECDHE, the client:
+        1. Generates an ephemeral EC key pair
+        2. Computes the shared secret via ECDH
+        3. Sends its public key to the server
+    
+    Returns:
+        Tuple of (ClientKeyExchange record, pre-master secret)
+    """
+    global client_key_exchange_msg
+    
+    curve_name, curve_obj, is_x25519 = ecdh_curve
+    
+    print("\n" + "="*60)
+    print("CLIENT KEY EXCHANGE (ECDHE)")
+    print("="*60)
+    print(f"Generating ephemeral {curve_name} key pair...")
+    
+    # Generate ephemeral client ECDH key pair
+    if is_x25519:
+        # x25519 uses different key generation
+        client_private_key = X25519PrivateKey.generate()
+        client_public_key = client_private_key.public_key()
+        
+        # Get public key bytes (32 bytes for x25519, no point format byte)
+        client_pubkey_bytes = client_public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+        
+        # Perform ECDH key exchange directly
+        shared_secret = client_private_key.exchange(server_ecdh_public_key)
+    else:
+        # Standard EC curves
+        client_private_key = ec.generate_private_key(curve_obj, default_backend())
+        client_public_key = client_private_key.public_key()
+        
+        # Get public key in uncompressed point format
+        client_pubkey_bytes = client_public_key.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint
+        )
+        
+        # Perform ECDH key exchange
+        shared_secret = client_private_key.exchange(ec.ECDH(), server_ecdh_public_key)
+    
+    print(f"Client Public Key Length: {len(client_pubkey_bytes)} bytes")
+    print(f"Client Public Key: {client_pubkey_bytes.hex()}")
+    print(f"Shared Secret (pre-master secret): {shared_secret.hex()}")
+    print()
+    
+    # Build ClientKeyExchange message
+    # Format: public key length (1 byte) + public key
+    handshake_body = bytes([len(client_pubkey_bytes)]) + client_pubkey_bytes
+    
+    handshake = (
+        bytes([CLIENT_KEY_EXCHANGE]) +
+        struct.pack("!I", len(handshake_body))[1:] +  # 24-bit length
+        handshake_body
+    )
+    
+    # Store for Finished message calculation
+    client_key_exchange_msg = handshake
+    
+    # Wrap in TLS record
+    record = (
+        bytes([HANDSHAKE_RECORD]) +
+        TLS_VERSION_1_2 +
+        struct.pack("!H", len(handshake)) +
+        handshake
+    )
+    
+    # The pre-master secret is the shared secret from ECDH
+    return record, shared_secret
+
+
+def PRF(secret, label, seed, length, hash_algorithm=None):
+    """
+    TLS 1.2 Pseudorandom Function (PRF) using HMAC-SHA256 or HMAC-SHA384.
     
     The PRF is used to expand secrets into key material:
         PRF(secret, label, seed) = P_SHA256(secret, label + seed)
@@ -662,6 +889,7 @@ def PRF(secret, label, seed, length):
         label: ASCII string label (e.g., "master secret", "key expansion")
         seed: Random seed material (client_random + server_random)
         length: Number of bytes to generate
+        hash_algorithm: Hash algorithm to use (SHA256 or SHA384)
         
     Returns:
         Expanded key material of specified length
@@ -678,6 +906,10 @@ def PRF(secret, label, seed, length):
             A(0) = seed
             A(i) = HMAC(secret, A(i-1))
     """
+    # Default to SHA256 if not specified
+    if hash_algorithm is None:
+        hash_algorithm = hashes.SHA256()
+    
     def P_hash(secret, seed, length):
         """HMAC-based key derivation function"""
         result = b""
@@ -685,12 +917,12 @@ def PRF(secret, label, seed, length):
         
         while len(result) < length:
             # A(i) = HMAC(secret, A(i-1))
-            h = hmac.HMAC(secret, hashes.SHA256(), backend=default_backend())
+            h = hmac.HMAC(secret, hash_algorithm, backend=default_backend())
             h.update(A)
             A = h.finalize()
             
             # Append HMAC(secret, A(i) + seed) to result
-            h = hmac.HMAC(secret, hashes.SHA256(), backend=default_backend())
+            h = hmac.HMAC(secret, hash_algorithm, backend=default_backend())
             h.update(A + seed)
             result += h.finalize()
             
@@ -707,35 +939,34 @@ def derive_keys(pre_master_secret, client_random, server_random, cipher_suite):
         1. pre_master_secret + randoms → master_secret (using PRF)
         2. master_secret + randoms → key_block (using PRF)
         3. key_block is split into:
-           - client_write_MAC_key
-           - server_write_MAC_key
-           - client_write_encryption_key
-           - server_write_encryption_key
-           - client_write_IV
-           - server_write_IV
+           For CBC: MAC keys + encryption keys
+           For GCM: encryption keys + fixed IVs
            
     Args:
-        pre_master_secret: 48 bytes (TLS 1.2) or 32 bytes (depends on cipher)
+        pre_master_secret: Shared secret from key exchange
         client_random: 32 bytes from ClientHello
         server_random: 32 bytes from ServerHello
         cipher_suite: Selected cipher suite bytes
         
     Returns:
         Dictionary with all derived keys
-        
-    Educational Note:
-        The master secret is what provides perfect forward secrecy (PFS) in
-        ephemeral key exchange modes like ECDHE. Even if the server's RSA
-        key is compromised later, past sessions can't be decrypted.
     """
     global master_secret
+    
+    # Determine hash algorithm based on cipher suite
+    # GCM-SHA384 cipher suites use SHA-384 for PRF
+    if cipher_suite == b"\xc0\x30":  # TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        hash_alg = hashes.SHA384()
+    else:
+        hash_alg = hashes.SHA256()
     
     # Step 1: Derive master secret from pre-master secret
     master_secret = PRF(
         pre_master_secret,
         "master secret",
         client_random + server_random,
-        48  # Master secret is always 48 bytes in TLS 1.2
+        48,  # Master secret is always 48 bytes in TLS 1.2
+        hash_alg
     )
     
     print("\n" + "="*60)
@@ -745,43 +976,57 @@ def derive_keys(pre_master_secret, client_random, server_random, cipher_suite):
     print(f"Master Secret:     {master_secret.hex()[:64]}...")
     print()
     
-    # Determine key sizes based on cipher suite
-    # For TLS_RSA_WITH_AES_128_CBC_SHA (0x002f):
-    #   - MAC key: 20 bytes (SHA-1)
-    #   - Encryption key: 16 bytes (AES-128)
-    #   - Note: TLS 1.2 with CBC uses explicit IVs (sent with each record)
-    #           so no IV is derived from the key block
-    if cipher_suite == b"\x00\x2f":
+    # Determine key sizes and mode based on cipher suite
+    is_gcm = cipher_suite in [b"\xc0\x2f", b"\xc0\x30"]  # GCM cipher suites
+    
+    if cipher_suite == b"\x00\x2f":  # TLS_RSA_WITH_AES_128_CBC_SHA
         mac_key_length = 20  # SHA-1
         enc_key_length = 16  # AES-128
-    elif cipher_suite == b"\x00\x35":
+        fixed_iv_length = 0  # CBC uses explicit IVs
+    elif cipher_suite == b"\x00\x35":  # TLS_RSA_WITH_AES_256_CBC_SHA
         mac_key_length = 20  # SHA-1
         enc_key_length = 32  # AES-256
+        fixed_iv_length = 0
+    elif cipher_suite == b"\xc0\x2f":  # TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        mac_key_length = 0  # GCM doesn't use separate MAC keys
+        enc_key_length = 16  # AES-128
+        fixed_iv_length = 4  # GCM uses 4-byte fixed IV
+    elif cipher_suite == b"\xc0\x30":  # TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        mac_key_length = 0  # GCM doesn't use separate MAC keys
+        enc_key_length = 32  # AES-256
+        fixed_iv_length = 4  # GCM uses 4-byte fixed IV
+    elif cipher_suite in [b"\xc0\x13", b"\xc0\x14"]:  # ECDHE with CBC
+        mac_key_length = 20  # SHA-1
+        enc_key_length = 16 if cipher_suite == b"\xc0\x13" else 32
+        fixed_iv_length = 0
     else:
         # Default to AES-128-CBC-SHA
         mac_key_length = 20
         enc_key_length = 16
+        fixed_iv_length = 0
     
     # Step 2: Derive key block from master secret
-    # For TLS 1.2 with CBC ciphers, key_block contains:
-    # client_write_MAC_key + server_write_MAC_key +
-    # client_write_key + server_write_key
-    # (No IVs - they are explicit/random per record)
-    key_block_length = 2 * (mac_key_length + enc_key_length)
+    key_block_length = 2 * (mac_key_length + enc_key_length + fixed_iv_length)
     key_block = PRF(
         master_secret,
         "key expansion",
         server_random + client_random,  # Note: reversed order!
-        key_block_length
+        key_block_length,
+        hash_alg
     )
     
     # Step 3: Partition key block into individual keys
     offset = 0
-    client_write_mac_key = key_block[offset:offset+mac_key_length]
-    offset += mac_key_length
     
-    server_write_mac_key = key_block[offset:offset+mac_key_length]
-    offset += mac_key_length
+    if mac_key_length > 0:
+        client_write_mac_key = key_block[offset:offset+mac_key_length]
+        offset += mac_key_length
+        
+        server_write_mac_key = key_block[offset:offset+mac_key_length]
+        offset += mac_key_length
+    else:
+        client_write_mac_key = b""
+        server_write_mac_key = b""
     
     client_write_key = key_block[offset:offset+enc_key_length]
     offset += enc_key_length
@@ -789,15 +1034,29 @@ def derive_keys(pre_master_secret, client_random, server_random, cipher_suite):
     server_write_key = key_block[offset:offset+enc_key_length]
     offset += enc_key_length
     
+    if fixed_iv_length > 0:
+        client_write_iv = key_block[offset:offset+fixed_iv_length]
+        offset += fixed_iv_length
+        
+        server_write_iv = key_block[offset:offset+fixed_iv_length]
+        offset += fixed_iv_length
+    else:
+        client_write_iv = b""
+        server_write_iv = b""
+    
     print("Derived Session Keys:")
     print("-" * 60)
-    print(f"Client Write MAC Key: {client_write_mac_key.hex()}")
-    print(f"Server Write MAC Key: {server_write_mac_key.hex()}")
+    if mac_key_length > 0:
+        print(f"Client Write MAC Key: {client_write_mac_key.hex()}")
+        print(f"Server Write MAC Key: {server_write_mac_key.hex()}")
     print(f"Client Write Key:     {client_write_key.hex()}")
     print(f"Server Write Key:     {server_write_key.hex()}")
-    print()
-    print("Note: TLS 1.2 with CBC uses explicit IVs (random per record)")
-    print("      IVs are not derived from the key block.")
+    if fixed_iv_length > 0:
+        print(f"Client Write IV:      {client_write_iv.hex()}")
+        print(f"Server Write IV:      {server_write_iv.hex()}")
+        print("\nNote: GCM mode uses fixed IVs with explicit nonces")
+    else:
+        print("\nNote: CBC mode uses explicit IVs (random per record)")
     print()
     
     return {
@@ -806,6 +1065,9 @@ def derive_keys(pre_master_secret, client_random, server_random, cipher_suite):
         'server_write_mac_key': server_write_mac_key,
         'client_write_key': client_write_key,
         'server_write_key': server_write_key,
+        'client_write_iv': client_write_iv,
+        'server_write_iv': server_write_iv,
+        'cipher_suite': cipher_suite,
     }
 
 
@@ -950,30 +1212,31 @@ def compute_mac(mac_key, seq_num, content_type, version, payload):
     return h.finalize()
 
 
-def compute_verify_data(master_secret, handshake_messages, label):
+def compute_verify_data(master_secret, handshake_messages, label, cipher_suite=None):
     """
     Computes the verify_data for the Finished message.
     
-    verify_data = PRF(master_secret, label, 
-                      SHA256(handshake_messages))[0:12]
+    verify_data = PRF(master_secret, label, Hash(handshake_messages))[0:12]
     
     Args:
         master_secret: The derived master secret
         handshake_messages: Concatenation of all handshake messages so far
         label: "client finished" or "server finished"
+        cipher_suite: Cipher suite to determine hash algorithm
         
     Returns:
         12 bytes of verify_data
-        
-    Educational Note:
-        The Finished message proves that both sides have the same view of
-        the handshake. Any tampering would result in different verify_data.
     """
-    # Hash all handshake messages
-    handshake_hash = hashlib.sha256(handshake_messages).digest()
+    # Determine hash algorithm based on cipher suite
+    if cipher_suite == b"\xc0\x30":  # GCM-SHA384
+        handshake_hash = hashlib.sha384(handshake_messages).digest()
+        hash_alg = hashes.SHA384()
+    else:
+        handshake_hash = hashlib.sha256(handshake_messages).digest()
+        hash_alg = hashes.SHA256()
     
     # Generate verify_data using PRF
-    verify_data = PRF(master_secret, label, handshake_hash, 12)
+    verify_data = PRF(master_secret, label, handshake_hash, 12, hash_alg)
     
     return verify_data
 
@@ -1089,6 +1352,90 @@ def decrypt_record(ciphertext, content_type, keys, seq_num):
     return plaintext
 
 
+def encrypt_record_gcm(plaintext, content_type, keys, seq_num):
+    """
+    Encrypts a TLS record using AES-GCM (AEAD).
+    
+    GCM Process:
+        1. Construct explicit nonce (8 bytes from sequence number)
+        2. Combine fixed_iv + explicit_nonce to get full nonce (12 bytes)
+        3. Construct Additional Authenticated Data (AAD)
+        4. Encrypt with AES-GCM (produces ciphertext + 16-byte auth tag)
+        
+    Args:
+        plaintext: Data to encrypt
+        content_type: TLS content type
+        keys: Session keys dictionary
+        seq_num: Current sequence number
+        
+    Returns:
+        Encrypted data (explicit_nonce + ciphertext + auth_tag)
+    """
+    # Explicit nonce (8 bytes) - using sequence number
+    explicit_nonce = struct.pack("!Q", seq_num)
+    
+    # Full nonce = fixed_iv (4 bytes) + explicit_nonce (8 bytes) = 12 bytes
+    nonce = keys['client_write_iv'] + explicit_nonce
+    
+    # Additional Authenticated Data (AAD)
+    # Format: seq_num + type + version + length
+    aad = (
+        struct.pack("!Q", seq_num) +
+        bytes([content_type]) +
+        TLS_VERSION_1_2 +
+        struct.pack("!H", len(plaintext))
+    )
+    
+    # Encrypt with AES-GCM
+    aesgcm = AESGCM(keys['client_write_key'])
+    ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
+    
+    # Return explicit_nonce + ciphertext (ciphertext includes auth tag)
+    return explicit_nonce + ciphertext
+
+
+def decrypt_record_gcm(ciphertext, content_type, keys, seq_num):
+    """
+    Decrypts a TLS record encrypted with AES-GCM.
+    
+    Args:
+        ciphertext: Encrypted data (explicit_nonce + ciphertext + auth_tag)
+        content_type: TLS content type
+        keys: Session keys dictionary
+        seq_num: Current sequence number
+        
+    Returns:
+        Decrypted plaintext (or None if authentication fails)
+    """
+    # Extract explicit nonce (first 8 bytes)
+    explicit_nonce = ciphertext[:8]
+    encrypted_data = ciphertext[8:]
+    
+    # Full nonce = fixed_iv (4 bytes) + explicit_nonce (8 bytes)
+    nonce = keys['server_write_iv'] + explicit_nonce
+    
+    # Reconstruct AAD
+    # We need to know the plaintext length, but we can calculate it:
+    # encrypted_data = plaintext + 16-byte auth tag
+    plaintext_length = len(encrypted_data) - 16
+    
+    aad = (
+        struct.pack("!Q", seq_num) +
+        bytes([content_type]) +
+        TLS_VERSION_1_2 +
+        struct.pack("!H", plaintext_length)
+    )
+    
+    # Decrypt with AES-GCM
+    try:
+        aesgcm = AESGCM(keys['server_write_key'])
+        plaintext = aesgcm.decrypt(nonce, encrypted_data, aad)
+        return plaintext
+    except Exception as e:
+        print(f"[ERROR] GCM decryption/authentication failed: {e}")
+        return None
+
+
 def build_finished(keys):
     """
     Builds the Finished handshake message (encrypted).
@@ -1135,10 +1482,12 @@ def build_finished(keys):
     print()
     
     # Compute verify_data
+    cipher_suite = keys.get('cipher_suite', b"\x00\x2f")
     verify_data = compute_verify_data(
         keys['master_secret'],
         handshake_messages,
-        "client finished"
+        "client finished",
+        cipher_suite
     )
     
     print(f"Verify Data: {verify_data.hex()}")
@@ -1155,23 +1504,27 @@ def build_finished(keys):
     print(f"Finished handshake message: {len(handshake)} bytes")
     print(f"  Type: 0x{FINISHED:02x} (Finished)")
     print(f"  Length: {len(verify_data)} bytes")
-    print(f"  Full message: {handshake.hex()}")
     print()
     
-    # Encrypt the Finished message
-    print("Encrypting Finished message:")
-    print("  1. Computing HMAC-SHA1 over handshake message")
-    print("  2. Appending MAC to message")
-    print("  3. Adding PKCS#7 padding")
-    print("  4. Encrypting with AES-128-CBC")
-    print()
+    # Encrypt the Finished message (use GCM or CBC based on cipher suite)
+    is_gcm = cipher_suite in [b"\xc0\x2f", b"\xc0\x30"]
     
-    encrypted_data = encrypt_record(
-        handshake,
-        HANDSHAKE_RECORD,
-        keys,
-        client_seq_num
-    )
+    if is_gcm:
+        print("Encrypting with AES-GCM...")
+        encrypted_data = encrypt_record_gcm(
+            handshake,
+            HANDSHAKE_RECORD,
+            keys,
+            client_seq_num
+        )
+    else:
+        print("Encrypting with AES-CBC + HMAC...")
+        encrypted_data = encrypt_record(
+            handshake,
+            HANDSHAKE_RECORD,
+            keys,
+            client_seq_num
+        )
     client_seq_num += 1
     
     # Wrap in TLS record
@@ -1197,10 +1550,6 @@ def send_application_data(sock, data, keys):
         sock: Connected socket
         data: Plaintext data to send (bytes)
         keys: Session keys dictionary
-        
-    Educational Note:
-        Application data is encrypted the same way as the Finished message:
-        MAC-then-Encrypt with AES-CBC and HMAC-SHA1.
     """
     global client_seq_num
     
@@ -1208,13 +1557,24 @@ def send_application_data(sock, data, keys):
     print(f"  Plaintext: {data[:100]}..." if len(data) > 100 else f"  Plaintext: {data}")
     print()
     
-    # Encrypt the application data
-    encrypted_data = encrypt_record(
-        data,
-        APPLICATION_DATA_RECORD,
-        keys,
-        client_seq_num
-    )
+    # Encrypt the application data (use GCM or CBC based on cipher suite)
+    cipher_suite = keys.get('cipher_suite', b"\x00\x2f")
+    is_gcm = cipher_suite in [b"\xc0\x2f", b"\xc0\x30"]
+    
+    if is_gcm:
+        encrypted_data = encrypt_record_gcm(
+            data,
+            APPLICATION_DATA_RECORD,
+            keys,
+            client_seq_num
+        )
+    else:
+        encrypted_data = encrypt_record(
+            data,
+            APPLICATION_DATA_RECORD,
+            keys,
+            client_seq_num
+        )
     client_seq_num += 1
     
     # Wrap in TLS record
@@ -1262,6 +1622,9 @@ def receive_application_data(sock, keys, timeout=5):
     
     plaintext_chunks = []
     
+    cipher_suite = keys.get('cipher_suite', b"\x00\x2f")
+    is_gcm = cipher_suite in [b"\xc0\x2f", b"\xc0\x30"]
+    
     for idx, record in enumerate(records):
         content_type = record[0]
         
@@ -1277,13 +1640,21 @@ def receive_application_data(sock, keys, timeout=5):
             
             print(f"  Encrypted payload: {len(encrypted_payload)} bytes")
             
-            # Decrypt the application data
-            decrypted = decrypt_record(
-                encrypted_payload,
-                APPLICATION_DATA_RECORD,
-                keys,
-                server_seq_num
-            )
+            # Decrypt the application data (use GCM or CBC based on cipher suite)
+            if is_gcm:
+                decrypted = decrypt_record_gcm(
+                    encrypted_payload,
+                    APPLICATION_DATA_RECORD,
+                    keys,
+                    server_seq_num
+                )
+            else:
+                decrypted = decrypt_record(
+                    encrypted_payload,
+                    APPLICATION_DATA_RECORD,
+                    keys,
+                    server_seq_num
+                )
             server_seq_num += 1
             
             if decrypted:
@@ -1345,14 +1716,15 @@ def main():
     print("="*60)
     print(f"Target: {hostname}:{port}")
     print("Protocol: TLS 1.2")
-    print("Cipher Suites Offered (RSA key exchange only):")
+    print("Cipher Suites Offered:")
     print("  - TLS_RSA_WITH_AES_128_CBC_SHA")
     print("  - TLS_RSA_WITH_AES_256_CBC_SHA")
+    print("  - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+    print("  - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384")
+    print("  - TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA")
+    print("  - TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA")
     print()
-    print("Note: Modern servers often require ECDHE cipher suites.")
-    print("      This implementation demonstrates RSA key exchange only.")
-    print("      If the server only supports ECDHE, the handshake will stop")
-    print("      with an educational message.")
+    print("Supported curves: secp256r1, secp384r1, secp521r1, x25519")
     print("="*60 + "\n")
     
     # Step 1: Establish TCP connection
@@ -1371,7 +1743,7 @@ def main():
     print(f"[OK] Sent ClientHello ({len(client_hello)} bytes)")
     print("   - TLS version: 1.2")
     print("   - SNI: " + hostname)
-    print("   - 2 cipher suites offered (RSA key exchange only)")
+    print("   - 6 cipher suites offered (RSA and ECDHE)")
     print("   - Extensions: SNI, Supported Groups, Signature Algorithms, EC Point Formats\n")
     
     # Step 3: Receive server response
@@ -1436,27 +1808,11 @@ def main():
         elif handshake_type == SERVER_KEY_EXCHANGE:
             server_key_exchange_msg = handshake
             has_server_key_exchange = True
-            print("\n" + "="*60)
-            print("SERVER KEY EXCHANGE")
-            print("="*60)
-            print(f"Received ServerKeyExchange message ({len(handshake)} bytes)")
-            print("This indicates the server selected an ECDHE cipher suite.")
-            print()
-            print("[LIMITATION] This educational implementation only supports")
-            print("             RSA key exchange, not ECDHE.")
-            print()
-            print("Cipher suite selected: {}".format(selected_cipher.hex() if 'selected_cipher' in globals() else 'unknown'))
-            cipher_names = {
-                b"\x00\x2f": "TLS_RSA_WITH_AES_128_CBC_SHA",
-                b"\x00\x35": "TLS_RSA_WITH_AES_256_CBC_SHA",
-                b"\xc0\x2f": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                b"\xc0\x30": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-                b"\xc0\x13": "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
-                b"\xc0\x14": "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
-            }
-            if 'selected_cipher' in globals():
-                print(f"  {cipher_names.get(selected_cipher, 'Unknown cipher')}")
-            print()
+            # Parse and verify the ServerKeyExchange message
+            if not parse_server_key_exchange(handshake_body, server_certificates[0]):
+                print("[ERROR] ServerKeyExchange parsing/verification failed")
+                sock.close()
+                return 1
 
         elif handshake_type == SERVER_HELLO_DONE:
             server_hello_done_msg = handshake
@@ -1472,37 +1828,14 @@ def main():
         sock.close()
         return 1
     
-    if has_server_key_exchange:
-        print("="*60)
-        print("HANDSHAKE CANNOT CONTINUE")
-        print("="*60)
-        print("The server selected an ECDHE cipher suite which requires")
-        print("elliptic curve key exchange.")
-        print()
-        print("This educational implementation demonstrates RSA key exchange only.")
-        print()
-        print("To complete this handshake, the client would need to:")
-        print("  1. Parse ServerKeyExchange (EC parameters + signature)")
-        print("  2. Verify the signature using server's public key")
-        print("  3. Perform ECDH key agreement")
-        print("  4. Send ClientKeyExchange with client's EC public key")
-        print("  5. Derive pre-master secret from ECDH shared secret")
-        print()
-        print("Educational Note:")
-        print("  ECDHE provides Perfect Forward Secrecy (PFS) - even if")
-        print("  the server's RSA key is compromised later, past sessions")
-        print("  cannot be decrypted because the ECDH keys are ephemeral.")
-        print()
-        print("For a complete implementation supporting ECDHE:")
-        print("  - Use Python's ssl module")
-        print("  - Or implement ECDH using cryptography.hazmat.primitives.asymmetric.ec")
-        print("\n" + "="*60 + "\n")
-        sock.close()
-        return 0
-    
     # Step 5: Send ClientKeyExchange
     print("Step 5: Completing TLS handshake...\n")
-    client_key_exchange_record, pre_master_secret = build_client_key_exchange(server_certificates[0])
+    
+    # Use ECDHE or RSA key exchange based on server's choice
+    if has_server_key_exchange:
+        client_key_exchange_record, pre_master_secret = build_client_key_exchange_ecdhe()
+    else:
+        client_key_exchange_record, pre_master_secret = build_client_key_exchange(server_certificates[0])
     
     # Step 6: Derive session keys
     keys = derive_keys(pre_master_secret, client_random, server_random, selected_cipher)
@@ -1565,13 +1898,24 @@ def main():
                     print(f"  Encrypted payload size: {len(encrypted_payload)} bytes")
                     print("  Attempting to decrypt...")
                     
-                    # Decrypt the Finished message
-                    decrypted = decrypt_record(
-                        encrypted_payload,
-                        HANDSHAKE_RECORD,
-                        keys,
-                        server_seq_num
-                    )
+                    # Decrypt the Finished message (use GCM or CBC based on cipher suite)
+                    cipher_suite = keys.get('cipher_suite', b"\x00\x2f")
+                    is_gcm = cipher_suite in [b"\xc0\x2f", b"\xc0\x30"]
+                    
+                    if is_gcm:
+                        decrypted = decrypt_record_gcm(
+                            encrypted_payload,
+                            HANDSHAKE_RECORD,
+                            keys,
+                            server_seq_num
+                        )
+                    else:
+                        decrypted = decrypt_record(
+                            encrypted_payload,
+                            HANDSHAKE_RECORD,
+                            keys,
+                            server_seq_num
+                        )
                     server_seq_num += 1
                     
                     if decrypted:
@@ -1586,28 +1930,35 @@ def main():
                             print("  Server Finished Message:")
                             print(f"    Verify Data: {server_verify_data.hex()}")
                             
-                            # Compute expected verify_data
-                            handshake_messages_with_client_finished = (
+                            # Compute expected verify_data (include ServerKeyExchange if present)
+                            handshake_messages_for_client_finished = (
                                 client_hello_msg +
                                 server_hello_msg +
                                 certificate_msg +
+                                server_key_exchange_msg +  # May be empty for RSA
                                 server_hello_done_msg +
-                                client_key_exchange_msg +
+                                client_key_exchange_msg
+                            )
+                            
+                            client_verify = compute_verify_data(
+                                keys['master_secret'],
+                                handshake_messages_for_client_finished,
+                                "client finished",
+                                cipher_suite
+                            )
+                            
+                            handshake_messages_with_client_finished = (
+                                handshake_messages_for_client_finished +
                                 bytes([FINISHED]) +
                                 struct.pack("!I", 12)[1:] +
-                                compute_verify_data(
-                                    keys['master_secret'],
-                                    client_hello_msg + server_hello_msg + 
-                                    certificate_msg + server_hello_done_msg + 
-                                    client_key_exchange_msg,
-                                    "client finished"
-                                )
+                                client_verify
                             )
                             
                             expected_verify_data = compute_verify_data(
                                 keys['master_secret'],
                                 handshake_messages_with_client_finished,
-                                "server finished"
+                                "server finished",
+                                cipher_suite
                             )
                             
                             print(f"    Expected:    {expected_verify_data.hex()}")
